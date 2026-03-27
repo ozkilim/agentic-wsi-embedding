@@ -1,0 +1,28 @@
+# WSI files (too large for git)
+*.tif
+*.svs
+*.ndpi
+*.mrxs
+*.scn
+*.bif
+*.vsi
+
+# Embedding outputs
+**/output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Conda/venv
+.conda/
+venv/
+*.egg-info/
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
