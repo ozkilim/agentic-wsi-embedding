@@ -75,6 +75,8 @@ python titan_pipeline/run_titan.py --wsi_dir /path/to/slides/ --output_dir /path
 | `--skip_errors` | off | Skip errored slides in batch mode |
 | `--overwrite` | off | Re-process slides that already have outputs |
 | `--export_pt` | off | Also save slide embeddings as legacy .pt files |
+| `--n_sample_patches` | `10` | Sample patch images to save per slide for QC |
+| `--mpp` | — | Override microns-per-pixel (e.g. 0.25 for 40x) |
 | `--custom_mpp_keys` | — | Custom metadata keys for microns-per-pixel |
 
 ## Output Format
@@ -90,6 +92,10 @@ output_dir/
 │   ├── patches/                        # Patch coordinates (H5)
 │   │   └── {slide_name}_patches.h5
 │   ├── visualization/                  # Patch grid overlays
+│   ├── sample_patches/{slide_name}/    # QC patch images (PNG + grid)
+│   │   ├── patch_00_x{X}_y{Y}.png
+│   │   ├── ...
+│   │   └── _sample_grid.jpg
 │   ├── features_conch_v15/             # CONCHv1.5 patch features (H5)
 │   │   └── {slide_name}.h5            # shape: (n_patches, 768)
 │   └── slide_features_titan/           # TITAN slide embeddings (H5)

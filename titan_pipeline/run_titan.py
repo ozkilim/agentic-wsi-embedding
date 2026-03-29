@@ -3,10 +3,10 @@
 TITAN Pipeline: WSI → Tissue Segmentation → Patching → CONCHv1.5 → TITAN Slide Embedding
 
 Uses TRIDENT (https://github.com/mahmoodlab/TRIDENT) for robust WSI processing.
-The pipeline follows the official MahmoodLab workflow:
+Each slide is processed end-to-end before moving to the next:
   1. Tissue segmentation (HEST / GrandQC / Otsu)
-  2. Patch coordinate extraction with tissue-aware filtering
-  3. CONCHv1.5 patch feature extraction (required by TITAN)
+  2. Patch coordinate extraction + sample patch QC images
+  3. CONCHv1.5 patch feature extraction
   4. TITAN slide-level feature extraction
 
 All intermediate outputs are saved for reproducibility and downstream analysis.
@@ -22,7 +22,13 @@ import sys
 import time
 import argparse
 import torch
+import numpy as np
 from pathlib import Path
+
+WSI_EXTENSIONS = {
+    ".svs", ".tif", ".tiff", ".ndpi", ".mrxs", ".scn", ".vms", ".vmu",
+    ".png", ".jpg", ".jpeg", ".sdpc", ".bif", ".vsi",
+}
 
 
 def check_trident():
@@ -45,7 +51,6 @@ def check_trident():
 def export_legacy_pt(h5_path, wsi_path, wsi_name, output_dir, target_mag, patch_size):
     """Export TRIDENT H5 slide embedding to legacy .pt format for backward compatibility."""
     import h5py
-    import numpy as np
 
     if not os.path.exists(h5_path):
         return None
@@ -69,29 +74,92 @@ def export_legacy_pt(h5_path, wsi_path, wsi_name, output_dir, target_mag, patch_
     return pt_path
 
 
-def process_single(args):
-    """Process a single WSI through the full TITAN pipeline using TRIDENT's Slide API."""
+def save_sample_patches(slide, patches_h5_path, save_dir, n_samples=10):
+    """
+    Save a grid of sample patch images for magnification QC.
+
+    Reads n_samples evenly-spaced patches from the coordinate H5 file,
+    extracts them from the WSI at full resolution, and saves:
+      - Individual patch PNGs
+      - A combined grid image for quick visual inspection
+    """
+    import h5py
+    from PIL import Image
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    with h5py.File(patches_h5_path, "r") as f:
+        coords = f["coords"][:]
+        patch_size_lv0 = int(f["coords"].attrs.get("patch_size_level0", 512))
+
+    n_patches = len(coords)
+    if n_patches == 0:
+        return None
+
+    n_samples = min(n_samples, n_patches)
+    indices = np.linspace(0, n_patches - 1, n_samples, dtype=int)
+    selected_coords = coords[indices]
+
+    patch_images = []
+    for i, (x, y) in enumerate(selected_coords):
+        patch = slide.read_region(
+            location=(int(x), int(y)),
+            level=0,
+            size=(patch_size_lv0, patch_size_lv0),
+            read_as="pil",
+        )
+        display_size = 512
+        patch_resized = patch.resize((display_size, display_size), Image.LANCZOS)
+        patch_resized.save(os.path.join(save_dir, f"patch_{i:02d}_x{x}_y{y}.png"))
+        patch_images.append(patch_resized)
+
+    ncols = min(5, n_samples)
+    nrows = (n_samples + ncols - 1) // ncols
+    display_size = 512
+    grid = Image.new("RGB", (ncols * display_size, nrows * display_size), (255, 255, 255))
+    for i, img in enumerate(patch_images):
+        col = i % ncols
+        row = i // ncols
+        grid.paste(img, (col * display_size, row * display_size))
+
+    grid_path = os.path.join(save_dir, "_sample_grid.jpg")
+    grid.save(grid_path, quality=95)
+    return grid_path
+
+
+def collect_wsi_paths(wsi_dir):
+    """Collect all WSI file paths from a directory."""
+    d = Path(wsi_dir)
+    if not d.is_dir():
+        print(f"ERROR: Directory not found: {d}")
+        sys.exit(1)
+    paths = sorted(
+        str(f) for f in d.iterdir() if f.suffix.lower() in WSI_EXTENSIONS
+    )
+    if not paths:
+        print(f"ERROR: No WSI files found in {d}")
+        sys.exit(1)
+    return paths
+
+
+def process_slide(slide_path, args, models):
+    """
+    Process one WSI end-to-end: seg → patch → sample QC → CONCHv1.5 → TITAN.
+
+    Models dict contains pre-loaded models to avoid reloading per slide:
+      - seg_model, patch_encoder, slide_encoder
+    """
     from trident import load_wsi
-    from trident.segmentation_models import segmentation_model_factory
-    from trident.patch_encoder_models import encoder_factory as patch_encoder_factory
-    from trident.slide_encoder_models import encoder_factory as slide_encoder_factory
 
     device = f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu"
     job_dir = args.output_dir
     mag = int(args.target_mag)
     patch_size = args.patch_size
     coords_subdir = f"{mag}x_{patch_size}px_0px_overlap"
-
     slide_feat_dir = os.path.join(job_dir, coords_subdir, "slide_features_titan")
 
-    t0 = time.time()
-    print(f"Processing: {args.wsi_path}")
-    print(f"Output dir: {job_dir}")
-    print(f"Device:     {device}")
-    print()
-
     load_kwargs = dict(
-        slide_path=args.wsi_path,
+        slide_path=slide_path,
         lazy_init=False,
         custom_mpp_keys=args.custom_mpp_keys,
     )
@@ -103,212 +171,117 @@ def process_single(args):
         wsi_name = slide.name
         final_h5 = os.path.join(slide_feat_dir, f"{wsi_name}.h5")
         if not args.overwrite and os.path.exists(final_h5):
-            print(f"SKIP (already exists): {final_h5}")
-            return final_h5
+            print(f"  SKIP (already exists): {final_h5}")
+            return final_h5, 0.0
+
+        t0 = time.time()
 
         # --- Step 1: Tissue segmentation ---
-        print("[1/4] Tissue segmentation...")
+        print("  [1/4] Tissue segmentation...")
         seg_device = "cpu" if args.segmenter == "otsu" else device
-        seg_model = segmentation_model_factory(
-            model_name=args.segmenter,
-            confidence_thresh=args.seg_conf_thresh,
-        )
         slide.segment_tissue(
-            segmentation_model=seg_model,
-            target_mag=seg_model.target_mag,
+            segmentation_model=models["seg_model"],
+            target_mag=models["seg_model"].target_mag,
             job_dir=job_dir,
             device=seg_device,
             holes_are_tissue=not args.remove_holes,
         )
-        del seg_model
-        if "cuda" in seg_device:
-            torch.cuda.empty_cache()
-        print(f"  -> Contours (GeoJSON): {os.path.join(job_dir, 'contours_geojson')}")
-        print(f"  -> Thumbnails:         {os.path.join(job_dir, 'contours')}")
-        print()
+        print(f"        -> contours_geojson/{wsi_name}.geojson")
 
         # --- Step 2: Patch coordinate extraction ---
-        print(f"[2/4] Extracting patch coordinates (mag={mag}x, size={patch_size}px)...")
+        print(f"  [2/4] Extracting patch coordinates ({mag}x, {patch_size}px)...")
         save_coords = os.path.join(job_dir, coords_subdir)
         coords_path = slide.extract_tissue_coords(
             target_mag=mag,
             patch_size=patch_size,
             save_coords=save_coords,
         )
-        print(f"  -> Coordinates: {coords_path}")
-
-        viz_path = slide.visualize_coords(
+        slide.visualize_coords(
             coords_path=coords_path,
             save_patch_viz=os.path.join(save_coords, "visualization"),
         )
-        print(f"  -> Visualization: {viz_path}")
-        print()
+
+        patches_h5 = os.path.join(save_coords, "patches", f"{wsi_name}_patches.h5")
+
+        import h5py
+        with h5py.File(patches_h5, "r") as f:
+            n_patches = len(f["coords"])
+        print(f"        -> {n_patches} patches")
+
+        # --- Step 2b: Save sample patch images for QC ---
+        sample_dir = os.path.join(save_coords, "sample_patches", wsi_name)
+        grid_path = save_sample_patches(
+            slide, patches_h5, sample_dir, n_samples=args.n_sample_patches,
+        )
+        if grid_path:
+            print(f"        -> {args.n_sample_patches} sample patches saved for QC")
 
         # --- Step 3: CONCHv1.5 patch feature extraction ---
-        print("[3/4] Extracting CONCHv1.5 patch features...")
-        patch_encoder = patch_encoder_factory("conch_v15")
-        patch_encoder.eval()
-        patch_encoder.to(device)
+        print("  [3/4] CONCHv1.5 patch features...")
         features_dir = os.path.join(save_coords, "features_conch_v15")
-        patches_h5 = os.path.join(save_coords, "patches", f"{wsi_name}_patches.h5")
         slide.extract_patch_features(
-            patch_encoder=patch_encoder,
+            patch_encoder=models["patch_encoder"],
             coords_path=patches_h5,
             save_features=features_dir,
             device=device,
             batch_limit=args.batch_size,
         )
-        del patch_encoder
-        torch.cuda.empty_cache()
-        print(f"  -> Patch features: {features_dir}")
-        print()
+        print(f"        -> features_conch_v15/{wsi_name}.h5")
 
         # --- Step 4: TITAN slide embedding ---
-        print("[4/4] Extracting TITAN slide embedding...")
-        slide_encoder = slide_encoder_factory("titan")
-        slide_encoder.eval()
-        slide_encoder.to(device)
+        print("  [4/4] TITAN slide embedding...")
         os.makedirs(slide_feat_dir, exist_ok=True)
         patch_feats_h5 = os.path.join(features_dir, f"{wsi_name}.h5")
         slide.extract_slide_features(
             patch_features_path=patch_feats_h5,
-            slide_encoder=slide_encoder,
+            slide_encoder=models["slide_encoder"],
             device=device,
             save_features=slide_feat_dir,
         )
-        del slide_encoder
-        torch.cuda.empty_cache()
-        print(f"  -> Slide embedding (H5): {slide_feat_dir}")
+        print(f"        -> slide_features_titan/{wsi_name}.h5")
 
     # Export backward-compatible .pt file
     if args.export_pt:
         pt_path = export_legacy_pt(
-            final_h5, args.wsi_path, wsi_name, job_dir, args.target_mag, patch_size
+            final_h5, slide_path, wsi_name, job_dir, args.target_mag, patch_size
         )
         if pt_path:
-            print(f"  -> Legacy .pt: {pt_path}")
+            print(f"        -> {wsi_name}_titan_embedding.pt")
 
     elapsed = time.time() - t0
-    print()
-    print(f"Done in {elapsed:.1f}s ({elapsed / 60:.1f} min)")
-    print(f"All outputs in: {os.path.abspath(job_dir)}")
-    return final_h5
+    return final_h5, elapsed
 
 
-def process_batch(args):
-    """Process a directory of WSIs through the full TITAN pipeline using TRIDENT's Processor."""
-    from trident import Processor
+def load_models(args):
+    """Load all models once, return a dict. Models are shared across slides."""
     from trident.segmentation_models import segmentation_model_factory
+    from trident.patch_encoder_models import encoder_factory as patch_encoder_factory
     from trident.slide_encoder_models import encoder_factory as slide_encoder_factory
 
     device = f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu"
-    job_dir = args.output_dir
-    mag = int(args.target_mag)
-    patch_size = args.patch_size
-    coords_subdir = f"{mag}x_{patch_size}px_0px_overlap"
 
-    t0 = time.time()
-    print(f"Batch mode: {args.wsi_dir}")
-    print(f"Output dir: {job_dir}")
-    print(f"Device:     {device}")
-    print()
-
-    processor = Processor(
-        job_dir=job_dir,
-        wsi_source=args.wsi_dir,
-        skip_errors=args.skip_errors,
-        custom_mpp_keys=args.custom_mpp_keys,
-    )
-
-    # --- Step 1: Tissue segmentation ---
-    print("=" * 60)
-    print("[1/3] TISSUE SEGMENTATION")
-    print("=" * 60)
-    seg_device = "cpu" if args.segmenter == "otsu" else device
+    print("[Models] Loading segmentation model...")
     seg_model = segmentation_model_factory(
         model_name=args.segmenter,
         confidence_thresh=args.seg_conf_thresh,
     )
-    processor.run_segmentation_job(
-        segmentation_model=seg_model,
-        seg_mag=seg_model.target_mag,
-        holes_are_tissue=not args.remove_holes,
-        batch_size=args.batch_size,
-        device=seg_device,
-    )
-    del seg_model
-    if "cuda" in seg_device:
-        torch.cuda.empty_cache()
-    print()
 
-    # --- Step 2: Patch coordinate extraction ---
-    print("=" * 60)
-    print("[2/3] PATCH COORDINATE EXTRACTION")
-    print("=" * 60)
-    processor.run_patching_job(
-        target_magnification=mag,
-        patch_size=patch_size,
-    )
-    print()
+    print("[Models] Loading CONCHv1.5 patch encoder...")
+    patch_encoder = patch_encoder_factory("conch_v15")
+    patch_encoder.eval()
+    patch_encoder.to(device)
 
-    # --- Step 3: Slide feature extraction ---
-    # TRIDENT automatically extracts CONCHv1.5 patch features if missing,
-    # then runs the TITAN slide encoder on top.
-    print("=" * 60)
-    print("[3/3] TITAN SLIDE EMBEDDING (+ CONCHv1.5 patch features)")
-    print("=" * 60)
+    print("[Models] Loading TITAN slide encoder...")
     slide_encoder = slide_encoder_factory("titan")
-    processor.run_slide_feature_extraction_job(
-        slide_encoder=slide_encoder,
-        coords_dir=coords_subdir,
-        device=device,
-        batch_limit=args.batch_size,
-    )
-    del slide_encoder
-    torch.cuda.empty_cache()
+    slide_encoder.eval()
+    slide_encoder.to(device)
 
-    # Export backward-compatible .pt files
-    if args.export_pt:
-        slide_feat_dir = os.path.join(job_dir, coords_subdir, "slide_features_titan")
-        if os.path.isdir(slide_feat_dir):
-            print()
-            print("Exporting legacy .pt files...")
-            for h5_name in sorted(os.listdir(slide_feat_dir)):
-                if not h5_name.endswith(".h5"):
-                    continue
-                wsi_name = h5_name[: -len(".h5")]
-                h5_path = os.path.join(slide_feat_dir, h5_name)
-                wsi_path = ""
-                for slide in processor.wsis:
-                    if slide.name == wsi_name:
-                        wsi_path = slide.slide_path if hasattr(slide, "slide_path") else ""
-                        break
-                pt_path = export_legacy_pt(
-                    h5_path, wsi_path, wsi_name, job_dir, args.target_mag, patch_size
-                )
-                if pt_path:
-                    print(f"  {pt_path}")
-
-    processor.release()
-
-    elapsed = time.time() - t0
-    print()
-    print("=" * 60)
-    print("SUMMARY")
-    print("=" * 60)
-    print(f"  Total time: {elapsed:.1f}s ({elapsed / 60:.1f} min)")
-    print(f"  Output dir: {os.path.abspath(job_dir)}")
-    print()
-    print("  Output structure:")
-    print(f"    {job_dir}/")
-    print(f"    ├── thumbnails/")
-    print(f"    ├── contours/                        # segmentation overlays")
-    print(f"    ├── contours_geojson/                # editable in QuPath")
-    print(f"    └── {coords_subdir}/")
-    print(f"        ├── patches/                     # patch coordinates (H5)")
-    print(f"        ├── visualization/               # patch grid overlays")
-    print(f"        ├── features_conch_v15/          # CONCHv1.5 patch features (H5)")
-    print(f"        └── slide_features_titan/        # TITAN slide embeddings (H5)")
+    print("[Models] All models loaded.\n")
+    return {
+        "seg_model": seg_model,
+        "patch_encoder": patch_encoder,
+        "slide_encoder": slide_encoder,
+    }
 
 
 def main():
@@ -324,6 +297,7 @@ Output structure:
   └── {mag}x_{patch_size}px_0px_overlap/
       ├── patches/                       Patch coordinates (H5)
       ├── visualization/                 Patch border visualizations
+      ├── sample_patches/{slide}/        Sample patch PNGs + grid for QC
       ├── features_conch_v15/            CONCHv1.5 patch features (H5)
       └── slide_features_titan/          TITAN slide embeddings (H5)
 
@@ -392,6 +366,14 @@ Examples:
         help="Exclude holes within tissue regions",
     )
 
+    # --- QC ---
+    parser.add_argument(
+        "--n_sample_patches",
+        type=int,
+        default=10,
+        help="Number of sample patch images to save per slide for QC (default: 10)",
+    )
+
     # --- Hardware & error handling ---
     parser.add_argument(
         "--gpu", type=int, default=0, help="GPU index (default: 0)"
@@ -421,10 +403,76 @@ Examples:
     check_trident()
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Collect slide paths
     if args.wsi_path:
-        process_single(args)
+        p = Path(args.wsi_path)
+        if not p.exists():
+            print(f"ERROR: WSI not found: {p}")
+            sys.exit(1)
+        wsi_paths = [str(p)]
     else:
-        process_batch(args)
+        wsi_paths = collect_wsi_paths(args.wsi_dir)
+
+    print(f"Output dir: {args.output_dir}")
+    print(f"Slides:     {len(wsi_paths)}")
+    print()
+
+    # Load all models once
+    models = load_models(args)
+
+    # Process each slide end-to-end
+    results = {"success": [], "skipped": [], "failed": []}
+    total_time = 0.0
+
+    for idx, wsi_path in enumerate(wsi_paths, 1):
+        print("=" * 60)
+        print(f"[{idx}/{len(wsi_paths)}] {Path(wsi_path).name}")
+        print("=" * 60)
+        try:
+            out, elapsed = process_slide(wsi_path, args, models)
+            total_time += elapsed
+            if elapsed > 0:
+                results["success"].append(wsi_path)
+                print(f"  Done in {elapsed:.1f}s ({elapsed / 60:.1f} min)")
+            else:
+                results["skipped"].append(wsi_path)
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            results["failed"].append(wsi_path)
+            if not args.skip_errors:
+                raise
+        print()
+
+    # Summary
+    print("=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+    print(f"  Processed: {len(results['success'])}")
+    print(f"  Skipped:   {len(results['skipped'])}")
+    print(f"  Failed:    {len(results['failed'])}")
+    print(f"  Total:     {total_time:.1f}s ({total_time / 60:.1f} min)")
+    if results["success"]:
+        avg = total_time / len(results["success"])
+        print(f"  Avg/slide: {avg:.1f}s ({avg / 60:.1f} min)")
+    if results["failed"]:
+        print(f"\n  Failed slides:")
+        for p in results["failed"]:
+            print(f"    - {p}")
+
+    mag = int(args.target_mag)
+    coords_subdir = f"{mag}x_{args.patch_size}px_0px_overlap"
+    print()
+    print("  Output structure:")
+    print(f"    {args.output_dir}/")
+    print(f"    ├── thumbnails/")
+    print(f"    ├── contours/")
+    print(f"    ├── contours_geojson/")
+    print(f"    └── {coords_subdir}/")
+    print(f"        ├── patches/")
+    print(f"        ├── visualization/")
+    print(f"        ├── sample_patches/              # QC patch images")
+    print(f"        ├── features_conch_v15/")
+    print(f"        └── slide_features_titan/")
 
 
 if __name__ == "__main__":
