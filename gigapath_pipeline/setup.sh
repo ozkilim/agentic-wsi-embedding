@@ -1,52 +1,91 @@
 #!/bin/bash
-# Setup for Prov-GigaPath pipeline
-# Creates/activates the gigapath conda env and installs all dependencies.
+# Setup for GigaPath pipeline (backed by TRIDENT)
+#
+# Creates the gigapath conda env and installs TRIDENT with slide-encoder support.
+# TRIDENT handles: tissue segmentation, patching, GigaPath patch + slide features.
+#
+# GigaPath requires specific dependencies: flash_attn==2.5.8, fairscale.
+#
 # Idempotent — safe to re-run.
 set -e
 
-echo "=== Prov-GigaPath Pipeline Setup ==="
+echo "=== GigaPath Pipeline Setup (via TRIDENT) ==="
 
 eval "$(conda shell.bash hook)"
 
+# --- 1. Conda environment ---
 if ! conda env list | grep -q "^gigapath "; then
-    echo "Creating gigapath conda environment..."
+    echo "Creating gigapath conda environment (Python 3.10)..."
     conda create -n gigapath python=3.10 -y
 fi
-
 conda activate gigapath
 
-echo "Installing dependencies..."
-pip install -q torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
-pip install -q "timm>=1.0.3"
-pip install -q transformers huggingface_hub
-pip install -q openslide-python h5py tqdm pillow numpy
-pip install -q fairscale einops
-pip install -q xformers==0.0.28.post3 --index-url https://download.pytorch.org/whl/cu124
+# --- 2. Install TRIDENT with slide-encoder extras ---
+TRIDENT_DIR="${HOME}/.local/share/trident"
 
-echo "Installing gigapath package from GitHub..."
-pip install -q git+https://github.com/prov-gigapath/prov-gigapath.git
+if [ ! -d "$TRIDENT_DIR" ]; then
+    echo "Cloning TRIDENT..."
+    git clone https://github.com/mahmoodlab/trident.git "$TRIDENT_DIR"
+else
+    echo "Updating TRIDENT..."
+    git -C "$TRIDENT_DIR" pull --ff-only 2>/dev/null || echo "  (pull skipped — local changes or detached HEAD)"
+fi
 
+echo "Installing TRIDENT [slide-encoders]..."
+pip install -e "$TRIDENT_DIR[slide-encoders]"
+
+# Pin timm (TRIDENT requires 0.9.16 for GigaPath patch encoder)
+pip install -q "timm==0.9.16"
+
+# --- 3. Install GigaPath-specific dependencies ---
+echo "Installing GigaPath-specific dependencies..."
+pip install -q fairscale
+pip install -q flash_attn==2.5.8 2>/dev/null || echo "  WARNING: flash_attn install failed — GigaPath slide encoder may not work. Try: pip install flash_attn==2.5.8"
+
+# Install gigapath package
+pip install -q "git+https://github.com/prov-gigapath/prov-gigapath.git" 2>/dev/null || echo "  WARNING: gigapath package install failed. Install manually."
+
+# --- 4. Verify HuggingFace model access ---
 echo ""
 echo "Verifying HuggingFace model access..."
 python -c "
 from huggingface_hub import HfApi
 api = HfApi()
-user = api.whoami()
-print(f'  HuggingFace user: {user[\"name\"]}')
+
+try:
+    user = api.whoami()
+    print(f'  HuggingFace user: {user[\"name\"]}')
+except Exception:
+    print('  WARNING: Not logged in to HuggingFace.')
+    print('  Run: huggingface-cli login')
+    print('  Then re-run this setup script.')
+    exit(1)
+
 print('  Checking prov-gigapath/prov-gigapath access...')
 try:
     api.model_info('prov-gigapath/prov-gigapath')
-    print('  OK — GigaPath model accessible')
+    print('    OK')
 except Exception as e:
-    print(f'  FAIL — Cannot access GigaPath model: {e}')
-    print('  Request access at https://huggingface.co/prov-gigapath/prov-gigapath')
+    print(f'    FAIL: {e}')
+    print('    Request access: https://huggingface.co/prov-gigapath/prov-gigapath')
     exit(1)
 "
+
+# --- 5. Run TRIDENT doctor ---
+echo ""
+echo "Running TRIDENT preflight checks..."
+trident-doctor --profile slide-encoders 2>/dev/null || echo "  (some checks may have warnings — see above)"
 
 echo ""
 echo "=== Setup complete ==="
 echo ""
 echo "Usage:"
 echo "  conda activate gigapath"
-echo "  python run_gigapath.py --wsi_path /path/to/slide.tif"
-echo "  python run_gigapath.py --wsi_dir /path/to/slides/ --output_dir ./embeddings"
+echo "  python run_gigapath.py --wsi_path /path/to/slide.svs --output_dir ./output"
+echo "  python run_gigapath.py --wsi_dir /path/to/slides/ --output_dir ./output"
+echo ""
+echo "Supported WSI formats:"
+echo "  OpenSlide: .svs .tif .tiff .ndpi .mrxs .scn .vms .vmu"
+echo "  Image:     .png .jpg .jpeg"
+echo "  CuCIM:     .svs .tif .tiff  (if cucim installed)"
+echo "  SDPC:      .sdpc            (if sdpc installed)"
