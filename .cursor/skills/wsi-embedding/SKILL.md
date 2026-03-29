@@ -9,69 +9,54 @@ description: >-
 
 # WSI Slide Embedding Pipelines
 
-This repo contains two standalone pipelines that produce a single slide-level
-embedding from whole-slide images. Both are fully self-contained — each has a
-conda environment, setup script, and run script.
+This repo contains two standalone pipelines that produce slide-level
+embeddings from whole-slide images.
 
 ## Available Models
 
-| Model | Env name | Embedding dim | Patch size (at 20x) | Script |
-|-------|----------|---------------|---------------------|--------|
-| **TITAN** (MahmoodLab) | `TITAN` | 768 | 512 | `titan_pipeline/run_titan.py` |
-| **Prov-GigaPath** | `gigapath` | 768 | 256 | `gigapath_pipeline/run_gigapath.py` |
+| Model | Env name | Embedding dim | Pipeline | Script |
+|-------|----------|---------------|----------|--------|
+| **TITAN** (MahmoodLab) | `TITAN` | 768 | TRIDENT (seg → patch → CONCHv1.5 → TITAN) | `titan_pipeline/run_titan.py` |
+| **Prov-GigaPath** | `gigapath` | 768 | Custom (threshold → tile → GigaPath) | `gigapath_pipeline/run_gigapath.py` |
 
-Both extract at **20x magnification** from 40x native WSIs by default.
+## TITAN Pipeline (Recommended)
 
-## Quick Reference
+The TITAN pipeline uses **TRIDENT** (https://github.com/mahmoodlab/TRIDENT)
+for the full processing flow, matching the official MahmoodLab workflow:
 
-### 1. First-time setup (run once per model)
+1. **Tissue segmentation** — ML-based (HEST/GrandQC) or classical (Otsu)
+2. **Patch coordinate extraction** — tissue-aware patching with H5 output
+3. **CONCHv1.5 patch features** — required patch encoder for TITAN
+4. **TITAN slide embedding** — multimodal whole-slide foundation model
+
+### 1. First-time setup (run once)
 
 ```bash
-# TITAN
 cd titan_pipeline && bash setup.sh
-
-# GigaPath
-cd gigapath_pipeline && bash setup.sh
 ```
 
-Setup is idempotent. The scripts create conda envs, install deps, and verify
-HuggingFace model access. If model access fails, the user needs to request
-access on HuggingFace (links are printed).
+Setup clones TRIDENT, installs it with slide-encoder support, and verifies
+HuggingFace model access for both TITAN and CONCHv1.5.
 
 ### 2. Check if environment already exists
 
 ```bash
-conda env list | grep -E "TITAN|gigapath"
+conda env list | grep TITAN
 ```
-
-If the env exists, skip setup.
 
 ### 3. Embed a single WSI
 
 ```bash
-# TITAN
 conda activate TITAN
-python titan_pipeline/run_titan.py --wsi_path /path/to/slide.tif --output_dir /path/to/output
-
-# GigaPath
-conda activate gigapath
-python gigapath_pipeline/run_gigapath.py --wsi_path /path/to/slide.tif --output_dir /path/to/output
+python titan_pipeline/run_titan.py --wsi_path /path/to/slide.svs --output_dir /path/to/output
 ```
 
 ### 4. Embed a directory of WSIs (batch mode)
 
 ```bash
-# TITAN
 conda activate TITAN
 python titan_pipeline/run_titan.py --wsi_dir /path/to/slides/ --output_dir /path/to/output
-
-# GigaPath
-conda activate gigapath
-python gigapath_pipeline/run_gigapath.py --wsi_dir /path/to/slides/ --output_dir /path/to/output
 ```
-
-Models load once and are reused across all slides. Already-processed slides
-are skipped (use `--overwrite` to force re-processing).
 
 ### 5. Common arguments
 
@@ -79,21 +64,60 @@ are skipped (use `--overwrite` to force re-processing).
 |----------|---------|-------------|
 | `--wsi_path` | — | Single WSI file (mutually exclusive with `--wsi_dir`) |
 | `--wsi_dir` | — | Directory of WSIs (mutually exclusive with `--wsi_path`) |
-| `--output_dir` | `./output` | Where to save `.pt` embedding files |
-| `--native_mag` | `40.0` | Native magnification of slides |
+| `--output_dir` | `./output` | Where to save all outputs |
 | `--target_mag` | `20.0` | Target extraction magnification |
-| `--batch_size` | 48 (TITAN) / 128 (GigaPath) | Tile batch size for GPU inference |
-| `--overwrite` | off | Re-embed slides that already have output files |
+| `--patch_size` | `512` | Patch size at target mag (512 required by TITAN) |
+| `--batch_size` | `32` | Batch size for GPU inference |
+| `--segmenter` | `hest` | Tissue segmenter: `hest`, `grandqc`, or `otsu` |
+| `--seg_conf_thresh` | `0.5` | Segmentation confidence threshold |
+| `--remove_holes` | off | Exclude holes within tissue regions |
+| `--gpu` | `0` | GPU index |
+| `--skip_errors` | off | Skip errored slides in batch mode |
+| `--overwrite` | off | Re-process slides that already have outputs |
+| `--export_pt` | off | Also save slide embeddings as legacy .pt files |
+| `--custom_mpp_keys` | — | Custom metadata keys for microns-per-pixel |
 
 ## Output Format
 
-Each WSI produces one `.pt` file named `{slide_stem}_{model}_embedding.pt`
-containing a dict:
+### TITAN — Full output structure
+
+```
+output_dir/
+├── thumbnails/                         # WSI thumbnails
+├── contours/                           # Segmentation overlay images
+├── contours_geojson/                   # GeoJSON contours (editable in QuPath)
+├── 20x_512px_0px_overlap/
+│   ├── patches/                        # Patch coordinates (H5)
+│   │   └── {slide_name}_patches.h5
+│   ├── visualization/                  # Patch grid overlays
+│   ├── features_conch_v15/             # CONCHv1.5 patch features (H5)
+│   │   └── {slide_name}.h5            # shape: (n_patches, 768)
+│   └── slide_features_titan/           # TITAN slide embeddings (H5)
+│       └── {slide_name}.h5            # shape: (768,)
+└── {slide_name}_titan_embedding.pt     # (only with --export_pt)
+```
+
+Load the slide embedding:
+
+```python
+# H5 format (default)
+import h5py, torch
+with h5py.File("output/20x_512px_0px_overlap/slide_features_titan/slide.h5", "r") as f:
+    emb = torch.from_numpy(f["features"][:])  # shape (768,)
+
+# Legacy .pt format (with --export_pt)
+data = torch.load("output/slide_titan_embedding.pt")
+emb = data["slide_embedding"]  # shape (1, 768)
+```
+
+### GigaPath — Output format
+
+Each WSI produces one `.pt` file named `{slide_stem}_gigapath_embedding.pt`:
 
 ```python
 {
-    "slide_embedding": tensor,    # shape (1, embed_dim)
-    "embedding_dim": int,         # 768 for both models
+    "slide_embedding": tensor,    # shape (1, 768)
+    "embedding_dim": int,
     "wsi_path": str,
     "wsi_name": str,
     "num_patches": int,
@@ -104,36 +128,31 @@ containing a dict:
 }
 ```
 
-Load with: `data = torch.load("slide_embedding.pt"); emb = data["slide_embedding"]`
-
 ## Supported WSI Formats
 
-`.tif`, `.svs`, `.ndpi`, `.mrxs`, `.scn`, `.bif`, `.vsi`
+### TITAN (via TRIDENT)
+- **OpenSlide**: `.svs`, `.tif`, `.tiff`, `.ndpi`, `.mrxs`, `.scn`, `.vms`, `.vmu`
+- **PIL/Image**: `.png`, `.jpg`, `.jpeg`
+- **CuCIM** (if installed): `.svs`, `.tif`, `.tiff`
+- **SDPC** (if installed): `.sdpc`
 
-## Typical Runtime
-
-On a Quadro RTX 8000 (48 GB):
-
-| Model | Per-slide (typical) | 100 slides |
-|-------|-------------------|------------|
-| TITAN | ~6 min | ~10 hours |
-| GigaPath | ~13 min | ~21 hours |
+### GigaPath
+- `.tif`, `.svs`, `.ndpi`, `.mrxs`, `.scn`, `.bif`, `.vsi`
 
 ## Workflow for an Agent
 
-When a user says "embed these slides with TITAN" (or GigaPath):
+When a user says "embed these slides with TITAN":
 
 1. Check conda env exists: `conda env list | grep TITAN`
 2. If missing, run setup: `cd titan_pipeline && bash setup.sh`
 3. Run the pipeline with the user's WSI path or directory
-4. Report the output directory and embedding shapes
+4. Report the output directory, intermediate outputs, and embedding shapes
 
 ## Known Issues
 
-- GigaPath's internal `torchscale/architecture/config.py` may be missing
-  `import numpy as np`. If you see `NameError: name 'np' is not defined`,
-  add that import to the installed package file.
-- GigaPath requires `xformers==0.0.28.post3` pinned to the cu124 index
-  (for compatibility with `torch==2.5.1` on RTX 8000 / compute capability 7.5).
-- WSIs with corrupted resolution metadata default to 40x native — override
-  with `--native_mag` if needed.
+- TITAN and CONCHv1.5 are gated models on HuggingFace — the user must
+  request access for both before running the pipeline.
+- GigaPath's `torchscale/architecture/config.py` may need `import numpy as np`.
+- If `timm != 0.9.16`, some models may fail to load.
+- WSIs without magnification metadata: use `--custom_mpp_keys` or provide
+  a CSV with `wsi,mpp` columns via TRIDENT's `--custom_list_of_wsis`.

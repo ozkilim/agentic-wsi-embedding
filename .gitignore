@@ -1,14 +1,25 @@
 # WSI files (too large for git)
 *.tif
+*.tiff
 *.svs
 *.ndpi
 *.mrxs
 *.scn
 *.bif
 *.vsi
+*.sdpc
 
-# Embedding outputs
+# Pipeline outputs (embeddings, features, segmentations, visualizations)
 **/output/
+*_output/
+**/contours/
+**/contours_geojson/
+**/thumbnails/
+**/features_*/
+**/slide_features_*/
+**/visualization/
+**/patches/
+*_embedding.pt
 
 # Python
 __pycache__/
